@@ -53,6 +53,8 @@ const posixOnly = { skip: process.platform === 'win32' ? 'fake engine is a POSIX
 
 /** Every path the server was asked for since the last test started. */
 let requests = [];
+let downloadStatus = 200;
+let unfinishedResponse = false;
 let server;
 let base;
 
@@ -60,7 +62,11 @@ before(async () => {
   server = http.createServer((req, res) => {
     requests.push(req.url);
     if (req.url === ASSET_PATH) {
-      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.writeHead(downloadStatus, { 'content-type': 'application/octet-stream' });
+      if (unfinishedResponse) {
+        res.write('unavailable');
+        return;
+      }
       res.end(PAYLOAD);
       return;
     }
@@ -73,7 +79,11 @@ before(async () => {
 
 after(() => new Promise((resolve) => server.close(resolve)));
 
-beforeEach(() => { requests = []; });
+beforeEach(() => {
+  requests = [];
+  downloadStatus = 200;
+  unfinishedResponse = false;
+});
 
 /**
  * A throwaway copy of the shim at `<tmp>/cli/bin/cli.js`, with the repo's
@@ -97,19 +107,20 @@ function stageShim(line = `${VERSION} ${ASSET} ${DIGEST}`) {
  * server lives in this process, so a synchronous spawn would block the event
  * loop and the child's fetch would never be answered.
  */
-function run(shim, args, env) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [shim, ...args], { env });
+function run(shim, args, env, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [shim, ...args], { env, timeout, windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', reject);
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
 }
 
 /** Stage a shim and run it with its own cache dir, optionally pre-filled with an unstamped binary. */
-async function runShim(args = ['engine-probe'], { line, cached } = {}) {
+async function runShim(args = ['engine-probe'], { line, cached, timeout } = {}) {
   const { dir, shim } = stageShim(line);
   if (cached) {
     fs.mkdirSync(path.join(dir, 'bin', VERSION), { recursive: true });
@@ -117,7 +128,7 @@ async function runShim(args = ['engine-probe'], { line, cached } = {}) {
   }
   const env = { ...process.env, IMPECCABLE_HOME: dir, IMPECCABLE_DOWNLOAD_BASE: base };
   delete env.IMPECCABLE_BIN;
-  return { ...(await run(shim, args, env)), home: dir };
+  return { ...(await run(shim, args, env, timeout)), home: dir };
 }
 
 /** Everything under the cache dir, so a refusal can be shown to leave no trace. */
@@ -160,6 +171,16 @@ describe('npm shim download verification', () => {
     const res = await runShim(['hello'], { line: `${VERSION} ${ASSET} ${'0'.repeat(64)}` });
     assert.equal(res.status, 127, res.stderr);
     assert.match(res.stderr, /checksum mismatch downloading/);
+    assert.deepEqual(requests, [ASSET_PATH]);
+    assert.deepEqual(cacheEntries(res.home), []);
+  });
+
+  it('exits after an HTTP error without waiting for its unfinished response body', async () => {
+    downloadStatus = 404;
+    unfinishedResponse = true;
+    const res = await runShim(['engine-probe'], { timeout: 3000 });
+    assert.equal(res.status, 127, res.stderr);
+    assert.match(res.stderr, /no binary for /);
     assert.deepEqual(requests, [ASSET_PATH]);
     assert.deepEqual(cacheEntries(res.home), []);
   });

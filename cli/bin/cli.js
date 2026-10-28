@@ -54,7 +54,12 @@ async function download() {
     throw new Error(`no checksum for engine ${VERSION} (${ASSET}) in ${MANIFEST}; refusing the unverified download`);
   }
   const res = await fetch(URL, { redirect: 'follow' });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    // Release rejected responses so an unfinished error body cannot hold the
+    // shim open while main() exits naturally.
+    await res.body?.cancel();
+    return null;
+  }
   const buf = Buffer.from(await res.arrayBuffer());
   if (createHash('sha256').update(buf).digest('hex') !== expected) {
     throw new Error(`checksum mismatch downloading ${URL}`);
